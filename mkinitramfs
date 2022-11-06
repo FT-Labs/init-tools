@@ -1,0 +1,96 @@
+#!/bin/sh
+
+
+export PATH='/usr/bin:/sbin:/bin'
+
+usage()
+{
+	cat << EOF
+
+Usage: mkinitramfs [option]... -o outfile [version]
+
+Options:
+  -c compress	Override COMPRESS setting in initramfs.conf.
+  -d destdir    Extracted initramfs image dir
+  -o outfile	Write to outfile.
+
+See mkinitramfs(8) for further details.
+
+EOF
+}
+
+usage_error()
+{
+	usage >&2
+	exit 2
+}
+
+OPTIONS=$(getopt -o c:d:hko:r:v --long help -n "$0" -- "$@") || usage_error
+
+eval set -- "$OPTIONS"
+
+while true; do
+	case "$1" in
+	-c)
+		compress="$2"
+		shift 2
+		;;
+	-d)
+		DESTDIR="$2"
+		shift 2
+		if [ ! -d "${DESTDIR}" ]; then
+			echo "${0}: ${DESTDIR}: Not a directory" >&2
+			exit 1
+		fi
+		;;
+	-h|--help)
+		usage
+		exit 0
+		;;
+	-o)
+		outfile="$2"
+		shift 2
+		;;
+	--)
+		shift
+		break
+		;;
+	*)
+		echo "Internal error!" >&2
+		exit 1
+		;;
+	esac
+done
+
+case "${compress}" in
+gzip)	# If we're doing a reproducible build, use gzip -n
+	if [ -n "${SOURCE_DATE_EPOCH}" ]; then
+		compress="gzip -n"
+	# Otherwise, substitute pigz if it's available
+	elif command -v pigz >/dev/null; then
+		compress=pigz
+	fi
+	;;
+lz4)	compress="lz4 -2 -l" ;;
+zstd)	compress="zstd -q -1 -T0" ;;
+xz)	compress="xz --check=crc32"
+	# If we're not doing a reproducible build, enable multithreading
+	test -z "${SOURCE_DATE_EPOCH}" && compress="$compress --threads=0"
+	;;
+bzip2|lzma|lzop)
+	# no parameters needed
+	;;
+*)	echo "W: Unknown compression command ${compress}" >&2 ;;
+esac
+
+
+[ "$(id -ru)" != 0 ] && cpio_owner_root="-R 0:0"
+
+
+create_ucode() {
+    find . -print0 | LC_ALL=C sort -z | cpio --null -R 0:0 -H newc -o --quiet > "$1"
+}
+
+create_maincpio() {
+    cd "${DESTDIR}" && find . | LC_ALL=C sort | cpio --quiet $cpio_owner_root -o -H newc >>"${outfile}" || exit 1
+}

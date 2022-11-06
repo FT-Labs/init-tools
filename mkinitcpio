@@ -1,0 +1,76 @@
+#!/bin/bash
+
+build_image() {
+    local out=$1 compressout=$1 compress=$2 errmsg pipestatus
+
+    case $compress in
+        cat)
+            msg "Creating uncompressed initcpio image: %s" "$out"
+            unset COMPRESSION_OPTIONS
+            ;;
+        *)
+            msg "Creating %s-compressed initcpio image: %s" "$compress" "$out"
+            ;;&
+        xz)
+            COMPRESSION_OPTIONS=('--check=crc32' "${COMPRESSION_OPTIONS[@]}")
+            ;;
+        lz4)
+            COMPRESSION_OPTIONS=('-l' "${COMPRESSION_OPTIONS[@]}")
+            ;;
+        zstd)
+            COMPRESSION_OPTIONS=('-T0' "${COMPRESSION_OPTIONS[@]}")
+            ;;
+    esac
+
+    if [[ -f "$out" ]]; then
+        local curr_size space_left_on_device
+
+        curr_size="$(stat --format="%s" "$out")"
+        space_left_on_device="$(($(stat -f --format="%a*%S" "$out")))"
+
+        # check if there is enough space on the device to write the image to a tempfile, fallback otherwise
+        # this assumes that the new image is not more than 1¼ times the size of the old one
+        (( $(($curr_size + ($curr_size/4))) < $space_left_on_device )) && compressout="$out".tmp
+    fi
+
+    pushd "$BUILDROOT" >/dev/null
+
+    # Reproducibility: set all timestamps to 0
+    find . -mindepth 1 -execdir touch -hcd "@0" "{}" +
+
+    # If this pipeline changes, |pipeprogs| below needs to be updated as well.
+    find . -mindepth 1 -printf '%P\0' |
+            sort -z |
+            LANG=C bsdtar --uid 0 --gid 0 --null -cnf - -T - |
+            LANG=C bsdtar --null -cf - --format=newc @- |
+            $compress "${COMPRESSION_OPTIONS[@]}" > "$compressout"
+
+    pipestatus=("${PIPESTATUS[@]}")
+    pipeprogs=('find' 'sort' 'bsdtar (step 1)' 'bsdtar (step 2)' "$compress")
+
+    popd >/dev/null
+
+    for (( i = 0; i < ${#pipestatus[*]}; ++i )); do
+        if (( pipestatus[i] )); then
+            errmsg="${pipeprogs[i]} reported an error"
+            break
+        fi
+    done
+
+    if (( _builderrors )); then
+        warning "errors were encountered during the build. The image may not be complete."
+    fi
+
+    if [[ $errmsg ]]; then
+        error "Image generation FAILED: %s" "$errmsg"
+        return 1
+    elif (( _builderrors == 0 )); then
+        msg "Image generation successful"
+    fi
+
+    # sync and rename as we only wrote to a tempfile so far to ensure consistency
+    if [[ "$compressout" != "$out" ]]; then
+        sync -d -- "$compressout"
+        mv -f -- "$compressout" "$out"
+    fi
+}
